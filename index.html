@@ -1,0 +1,794 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.13/html-to-image.min.js" integrity="sha512-iZ2ORl595Wx6miw+GuadDet4WQbdSWS3JLMoNfY8cRGoEFy6oT3G9IbcrBeL6AfkgpA51ETt/faX6yLV+/gFJg==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+    <script>
+      (function() {
+        const originalConsole = window.console;
+        window.console = {
+          log: (...args) => {
+            originalConsole.log(...args);
+            window.parent.postMessage({ type: 'console', message: args.join(' ') }, '*');
+          },
+          error: (...args) => {
+            originalConsole.error(...args);
+            window.parent.postMessage({ type: 'console', message: 'Error: ' + args.join(' ') }, '*');
+          },
+          warn: (...args) => {
+            originalConsole.warn(...args);
+            window.parent.postMessage({ type: 'console', message: 'Warning: ' + args.join(' ') }, '*');
+          }
+        };
+
+        let requestId = 0;
+        let callbacksMap = new Map();
+        let streamControllers = new Map();
+        
+        window.claude = {
+          complete: (prompt) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'claudeComplete', id, prompt }, '*');
+            });
+          }
+        };
+
+        let pendingBlobs = new Map();
+        URL.createObjectURL = (blob) => {
+          // Store the blob and create an ID and URL for it
+          const blobId = `blob-${Date.now()}-${Math.random()}`;
+          pendingBlobs.set(blobId, blob);
+          return `blob-request://${blobId}`;
+        };
+
+        URL.revokeObjectURL = (url) => {
+          // Remove the blob from our store
+          const blobId = url.replace("blob-request://", "");
+          pendingBlobs.delete(blobId);
+        };
+
+        const getBlobFromURL = (url) => {
+          const blobId = url.replace("blob-request://", "");
+          return pendingBlobs.get(blobId);
+        };
+
+        // Override global fetch with streaming support
+        window.fetch = (url, init = {}) => {
+          return new Promise((resolve, reject) => {
+            const id = requestId++;
+            const channelId = `fetch-${id}-${Date.now()}`;
+            
+            callbacksMap.set(id, { 
+              resolve: (response) => {
+                // Create a ReadableStream for the response body
+                const stream = new ReadableStream({
+                  start(controller) {
+                    streamControllers.set(channelId, controller);
+                  },
+                  cancel() {
+                    streamControllers.delete(channelId);
+                  }
+                });
+                
+                // Create and return the Response with the stream
+                resolve(new Response(stream, {
+                  status: response.status,
+                  statusText: response.statusText,
+                  headers: response.headers
+                }));
+              },
+              reject,
+              channelId
+            });
+            
+            window.parent.postMessage({
+              type: 'proxyFetch',
+              id,
+              url,
+              init,
+              channelId
+            }, '*');
+          });
+        };
+
+        window.addEventListener('message', async (event) => {
+          if (event.data.type === 'takeScreenshot') {
+            const rootElement = document.getElementById('artifacts-component-root-html');
+            if (!rootElement) {
+              window.parent.postMessage({
+                type: 'screenshotError',
+                error: new Error('Root element not found'),
+              }, '*');
+            }
+            const screenshot = await htmlToImage.toPng(rootElement, {
+              imagePlaceholder:
+                "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAA1JREFUGFdjePDgwX8ACOQDoNsk0PMAAAAASUVORK5CYII=",
+            });
+            window.parent.postMessage({
+              type: 'screenshotData',
+              data: screenshot,
+            }, '*');
+          } else if (event.data.type === 'claudeComplete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.completion);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'proxyFetchResponse') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+              callbacksMap.delete(event.data.id);
+            } else {
+              // Initial response with headers, status, etc.
+              callback.resolve({
+                status: event.data.status,
+                statusText: event.data.statusText,
+                headers: event.data.headers
+              });
+              // Don't delete the callback yet if streaming
+              if (!event.data.body) {
+                callbacksMap.delete(event.data.id);
+              }
+            }
+          } else if (event.data.type === 'proxyFetchStream') {
+            // Handle streaming data chunks
+            const controller = streamControllers.get(event.data.channelId);
+            if (controller) {
+              if (event.data.error) {
+                controller.error(new Error(event.data.error));
+                streamControllers.delete(event.data.channelId);
+              } else if (event.data.done) {
+                controller.close();
+                streamControllers.delete(event.data.channelId);
+                // Clean up the callback
+                const callback = Array.from(callbacksMap.entries()).find(
+                  ([_, value]) => value.channelId === event.data.channelId
+                );
+                if (callback) {
+                  callbacksMap.delete(callback[0]);
+                }
+              } else if (event.data.chunk) {
+                controller.enqueue(new Uint8Array(event.data.chunk));
+              }
+            }
+          }
+        });
+
+        window.addEventListener('click', (event) => {
+          const isEl = event.target instanceof HTMLElement;
+          if (!isEl) return;
+    
+          // find ancestor links
+          const linkEl = event.target.closest("a");
+          if (!linkEl || !linkEl.href) return;
+    
+          event.preventDefault();
+          event.stopImmediatePropagation();
+    
+          if (linkEl.href.startsWith("blob-request:")) {
+            const blob = getBlobFromURL(linkEl.href);
+            if (!blob) return;
+            void blob.arrayBuffer().then((data) => {
+              window.parent.postMessage({
+                type: "downloadFile",
+                filename: linkEl.download,
+                data,
+                mimeType: blob.type || "application/octet-stream",
+              });
+            });
+          } else if (linkEl.href.startsWith("data:")) {
+            const [header, base64Data] = linkEl.href.split(",");
+            const mimeMatch = header.match(/data:([^;]+)/);
+            const mimeType = mimeMatch ? mimeMatch[1] : "application/octet-stream";
+            const binaryString = atob(base64Data);
+            const data = Uint8Array.from(binaryString, (c) =>
+              c.charCodeAt(0),
+            ).buffer;
+            window.parent.postMessage({
+              type: "downloadFile",
+              filename: linkEl.download,
+              data,
+              mimeType,
+            });
+          } else {
+            let linkUrl;
+            try {
+              linkUrl = new URL(linkEl.href);
+            } catch (error) {
+              return;
+            }
+    
+            if (linkUrl.hostname === window.location.hostname) return;
+      
+            window.parent.postMessage({
+              type: 'openExternal',
+              href: linkEl.href,
+            }, '*');
+          }
+      });
+
+        const originalOpen = window.open;
+        window.open = function (url) {
+          window.parent.postMessage({
+            type: "openExternal",
+            href: url,
+          }, "*");
+        };
+
+        window.addEventListener('error', (event) => {
+          window.parent.postMessage({ type: 'console', message: 'Uncaught Error: ' + event.message }, '*');
+        });
+      })();
+    </script>
+  
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>K-Health Ticket - 의료 데이터 주권화 플랫폼</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            line-height: 1.6;
+            color: #2c3e50;
+            overflow-x: hidden;
+        }
+        
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 0 20px;
+        }
+        
+        /* Hero Section */
+        .hero {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            position: relative;
+            overflow: hidden;
+        }
+        
+        .hero::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><defs><pattern id="grid" width="10" height="10" patternUnits="userSpaceOnUse"><path d="M 10 0 L 0 0 0 10" fill="none" stroke="rgba(255,255,255,0.1)" stroke-width="0.5"/></pattern></defs><rect width="100" height="100" fill="url(%23grid)"/></svg>');
+            opacity: 0.3;
+        }
+        
+        .hero-content {
+            position: relative;
+            z-index: 2;
+            text-align: center;
+        }
+        
+        .hero h1 {
+            font-size: 3.5rem;
+            font-weight: 700;
+            margin-bottom: 1rem;
+            animation: fadeInUp 1s ease-out;
+        }
+        
+        .hero-subtitle {
+            font-size: 1.5rem;
+            margin-bottom: 2rem;
+            opacity: 0.9;
+            animation: fadeInUp 1s ease-out 0.2s both;
+        }
+        
+        .hero-description {
+            font-size: 1.1rem;
+            max-width: 600px;
+            margin: 0 auto 2rem;
+            opacity: 0.8;
+            animation: fadeInUp 1s ease-out 0.4s both;
+        }
+        
+        .cta-button {
+            display: inline-block;
+            padding: 16px 32px;
+            background: rgba(255,255,255,0.2);
+            color: white;
+            text-decoration: none;
+            border-radius: 50px;
+            font-weight: 600;
+            font-size: 1.1rem;
+            backdrop-filter: blur(10px);
+            border: 2px solid rgba(255,255,255,0.3);
+            transition: all 0.3s ease;
+            animation: fadeInUp 1s ease-out 0.6s both;
+        }
+        
+        .cta-button:hover {
+            background: rgba(255,255,255,0.3);
+            transform: translateY(-2px);
+            box-shadow: 0 10px 25px rgba(0,0,0,0.2);
+        }
+        
+        /* Section Base */
+        .section {
+            padding: 80px 0;
+            position: relative;
+        }
+        
+        .section-title {
+            text-align: center;
+            font-size: 2.5rem;
+            font-weight: 600;
+            margin-bottom: 3rem;
+            color: #2c3e50;
+        }
+        
+        /* Hook Section */
+        .hook-section {
+            background: #f8fafc;
+            position: relative;
+        }
+        
+        .problem-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 2rem;
+            margin-bottom: 3rem;
+        }
+        
+        .problem-card {
+            background: white;
+            padding: 2rem;
+            border-radius: 16px;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.08);
+            border-left: 4px solid #ef4444;
+            transition: transform 0.3s ease;
+        }
+        
+        .problem-card:hover {
+            transform: translateY(-5px);
+        }
+        
+        .problem-icon {
+            width: 60px;
+            height: 60px;
+            background: #fee2e2;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin-bottom: 1rem;
+            font-size: 1.5rem;
+        }
+        
+        .solution-highlight {
+            background: linear-gradient(135deg, #10b981 0%, #059669 100%);
+            color: white;
+            padding: 3rem;
+            border-radius: 20px;
+            text-align: center;
+            margin-top: 3rem;
+        }
+        
+        /* Features Section */
+        .features-section {
+            background: white;
+        }
+        
+        .features-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(350px, 1fr));
+            gap: 2rem;
+            margin-top: 3rem;
+        }
+        
+        .feature-card {
+            background: linear-gradient(135deg, #f8fafc 0%, #e2e8f0 50%, #f8fafc 100%);
+            padding: 2rem;
+            border-radius: 16px;
+            position: relative;
+            overflow: hidden;
+            border: 2px solid #e2e8f0;
+            transition: all 0.3s ease;
+        }
+        
+        .feature-card:hover {
+            border-color: #667eea;
+            transform: translateY(-5px);
+            box-shadow: 0 10px 30px rgba(102, 126, 234, 0.15);
+        }
+        
+        .feature-icon {
+            width: 80px;
+            height: 80px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: white;
+            font-size: 2rem;
+            margin-bottom: 1.5rem;
+        }
+        
+        .feature-title {
+            font-size: 1.3rem;
+            font-weight: 600;
+            margin-bottom: 1rem;
+            color: #2c3e50;
+        }
+        
+        /* Connection Section */
+        .connection-section {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            position: relative;
+        }
+        
+        .connection-visual {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            margin: 3rem 0;
+            flex-wrap: wrap;
+            gap: 2rem;
+        }
+        
+        .stakeholder {
+            background: rgba(255,255,255,0.1);
+            backdrop-filter: blur(10px);
+            padding: 2rem;
+            border-radius: 20px;
+            text-align: center;
+            border: 2px solid rgba(255,255,255,0.2);
+            min-width: 200px;
+            transition: all 0.3s ease;
+        }
+        
+        .stakeholder:hover {
+            background: rgba(255,255,255,0.2);
+            transform: scale(1.05);
+        }
+        
+        .stakeholder-icon {
+            font-size: 3rem;
+            margin-bottom: 1rem;
+        }
+        
+        .connection-arrow {
+            font-size: 2rem;
+            opacity: 0.7;
+            animation: pulse 2s infinite;
+        }
+        
+        .efficiency-stats {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 2rem;
+            margin-top: 3rem;
+        }
+        
+        .stat-card {
+            text-align: center;
+            background: rgba(255,255,255,0.1);
+            padding: 2rem;
+            border-radius: 16px;
+            backdrop-filter: blur(10px);
+        }
+        
+        .stat-number {
+            font-size: 3rem;
+            font-weight: 700;
+            margin-bottom: 0.5rem;
+        }
+        
+        /* Closing Section */
+        .closing-section {
+            background: #f8fafc;
+            text-align: center;
+        }
+        
+        .closing-content {
+            max-width: 800px;
+            margin: 0 auto;
+        }
+        
+        .benefits-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 2rem;
+            margin: 3rem 0;
+        }
+        
+        .benefit-item {
+            background: white;
+            padding: 2rem;
+            border-radius: 12px;
+            box-shadow: 0 2px 15px rgba(0,0,0,0.08);
+        }
+        
+        .benefit-icon {
+            width: 60px;
+            height: 60px;
+            background: linear-gradient(135deg, #10b981 0%, #059669 100%);
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: white;
+            font-size: 1.5rem;
+            margin: 0 auto 1rem;
+        }
+        
+        .contact-section {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            text-align: center;
+            padding: 4rem 0;
+        }
+        
+        .contact-button {
+            display: inline-block;
+            padding: 20px 40px;
+            background: white;
+            color: #667eea;
+            text-decoration: none;
+            border-radius: 50px;
+            font-weight: 600;
+            font-size: 1.2rem;
+            margin-top: 2rem;
+            transition: all 0.3s ease;
+        }
+        
+        .contact-button:hover {
+            transform: translateY(-3px);
+            box-shadow: 0 10px 30px rgba(0,0,0,0.2);
+        }
+        
+        /* Animations */
+        @keyframes fadeInUp {
+            from {
+                opacity: 0;
+                transform: translateY(30px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+        
+        @keyframes pulse {
+            0%, 100% { opacity: 0.7; }
+            50% { opacity: 1; }
+        }
+        
+        /* Mobile Responsive */
+        @media (max-width: 768px) {
+            .hero h1 { font-size: 2.5rem; }
+            .hero-subtitle { font-size: 1.2rem; }
+            .section-title { font-size: 2rem; }
+            .connection-visual { flex-direction: column; }
+            .connection-arrow { transform: rotate(90deg); }
+        }
+    </style>
+</head>
+<body id="artifacts-component-root-html">
+    <!-- Hero Section -->
+    <section class="hero">
+        <div class="container">
+            <div class="hero-content">
+                <h1>K-Health Ticket</h1>
+                <div class="hero-subtitle">블록체인 기반 의료 데이터 주권화 플랫폼</div>
+                <p class="hero-description">
+                    NFT 처방전으로 의료 기관 간 안전하고 효율적인 정보 연동을 실현합니다
+                </p>
+                <a href="#contact" class="cta-button">도입 문의하기</a>
+            </div>
+        </div>
+    </section>
+
+    <!-- Hook & Problem Section -->
+    <section class="section hook-section">
+        <div class="container">
+            <h2 class="section-title">왜 K-Health Ticket이 필요한가요?</h2>
+            
+            <div class="problem-grid">
+                <div class="problem-card">
+                    <div class="problem-icon">📄</div>
+                    <h3>종이 의존성 문제</h3>
+                    <p>처방전과 진료확인서의 분실, 위조 위험과 보관의 불편함이 지속되고 있습니다.</p>
+                </div>
+                
+                <div class="problem-card">
+                    <div class="problem-icon">✈️</div>
+                    <h3>국제 진료 연계 불편</h3>
+                    <p>해외 진료 후 입국 시 다국어 서식 차이로 인한 의사소통 어려움과 추가 심사가 발생합니다.</p>
+                </div>
+                
+                <div class="problem-card">
+                    <div class="problem-icon">🔄</div>
+                    <h3>기관 간 확인 비효율</h3>
+                    <p>병원, 약국 간 처방 이력 공유 불가로 인한 중복 확인과 신뢰성 검증의 어려움이 있습니다.</p>
+                </div>
+            </div>
+            
+            <div class="solution-highlight">
+                <h3 style="margin-bottom: 1rem; font-size: 1.8rem;">💡 K-Health Ticket이 해결합니다</h3>
+                <p style="font-size: 1.1rem;">블록체인 기술로 의료 데이터를 NFT화하여 위변조 방지, 실시간 검증, 글로벌 호환성을 제공합니다</p>
+            </div>
+        </div>
+    </section>
+
+    <!-- Features Section -->
+    <section class="section features-section">
+        <div class="container">
+            <h2 class="section-title">핵심 기능</h2>
+            
+            <div class="features-grid">
+                <div class="feature-card">
+                    <div class="feature-icon">🏥</div>
+                    <div class="feature-title">병원용 관리자</div>
+                    <p>진료 기록 작성부터 블록체인 컨트랙트 키 발급까지 원스톱 처리. 기존 EMR 시스템과 연동 가능하며, 의료진의 업무 효율성을 극대화합니다.</p>
+                    <ul style="margin-top: 1rem; color: #64748b;">
+                        <li>• 진료 기록 디지털화 및 암호화</li>
+                        <li>• NFT 처방전 자동 생성</li>
+                        <li>• 기존 병원 시스템 연동</li>
+                    </ul>
+                </div>
+                
+                <div class="feature-card">
+                    <div class="feature-icon">💊</div>
+                    <div class="feature-title">약국용 검증 시스템</div>
+                    <p>QR 코드 스캔만으로 처방전의 진위 여부를 즉시 확인. 복잡한 확인 절차 없이 안전하고 빠른 조제 서비스를 제공할 수 있습니다.</p>
+                    <ul style="margin-top: 1rem; color: #64748b;">
+                        <li>• 실시간 처방전 검증</li>
+                        <li>• 약물 정보 자동 확인</li>
+                        <li>• 조제 내역 블록체인 기록</li>
+                    </ul>
+                </div>
+                
+                <div class="feature-card">
+                    <div class="feature-icon">🛂</div>
+                    <div class="feature-title">공항/검역 솔루션</div>
+                    <p>국제 표준 의료 정보를 즉시 확인하여 입국 심사 시간을 단축. 다국어 지원으로 언어 장벽 없는 의료 정보 확인이 가능합니다.</p>
+                    <ul style="margin-top: 1rem; color: #64748b;">
+                        <li>• 다국어 의료 정보 지원</li>
+                        <li>• 빠른 검역 승인 처리</li>
+                        <li>• 국제 표준 호환성</li>
+                    </ul>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- Connection & Efficiency Section -->
+    <section class="section connection-section">
+        <div class="container">
+            <h2 class="section-title">의료 이해관계자 간 연결 효율성</h2>
+            
+            <div class="connection-visual">
+                <div class="stakeholder">
+                    <div class="stakeholder-icon">🏥</div>
+                    <h4>병원</h4>
+                    <p>진료 기록 생성</p>
+                </div>
+                
+                <div class="connection-arrow">→</div>
+                
+                <div class="stakeholder">
+                    <div class="stakeholder-icon">🔗</div>
+                    <h4>블록체인</h4>
+                    <p>NFT 처방전 발행</p>
+                </div>
+                
+                <div class="connection-arrow">→</div>
+                
+                <div class="stakeholder">
+                    <div class="stakeholder-icon">👤</div>
+                    <h4>환자</h4>
+                    <p>디지털 보관</p>
+                </div>
+                
+                <div class="connection-arrow">→</div>
+                
+                <div class="stakeholder">
+                    <div class="stakeholder-icon">💊</div>
+                    <h4>약국/검역</h4>
+                    <p>즉시 검증</p>
+                </div>
+            </div>
+            
+            <div style="text-align: center; margin: 3rem 0;">
+                <h3 style="font-size: 1.5rem; margin-bottom: 1rem;">🚀 도입 효과</h3>
+                <p style="font-size: 1.1rem; opacity: 0.9;">기존 종이 기반 시스템 대비 획기적인 효율성 향상</p>
+            </div>
+            
+            <div class="efficiency-stats">
+                <div class="stat-card">
+                    <div class="stat-number">90%</div>
+                    <div>처리 시간 단축</div>
+                </div>
+                
+                <div class="stat-card">
+                    <div class="stat-number">100%</div>
+                    <div>위변조 방지</div>
+                </div>
+                
+                <div class="stat-card">
+                    <div class="stat-number">24/7</div>
+                    <div>실시간 검증</div>
+                </div>
+                
+                <div class="stat-card">
+                    <div class="stat-number">Zero</div>
+                    <div>분실 위험</div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- Closing Section -->
+    <section class="section closing-section">
+        <div class="container">
+            <div class="closing-content">
+                <h2 class="section-title">미래 의료 서비스의 새로운 표준</h2>
+                <p style="font-size: 1.1rem; margin-bottom: 2rem; color: #64748b;">
+                    K-Health Ticket과 함께 의료 데이터 주권화 시대를 선도하세요
+                </p>
+                
+                <div class="benefits-grid">
+                    <div class="benefit-item">
+                        <div class="benefit-icon">🔒</div>
+                        <h4>신뢰성</h4>
+                        <p>블록체인 기반 위변조 방지로 100% 신뢰할 수 있는 의료 정보</p>
+                    </div>
+                    
+                    <div class="benefit-item">
+                        <div class="benefit-icon">⚡</div>
+                        <h4>편의성</h4>
+                        <p>QR 코드 스캔만으로 즉시 확인 가능한 직관적 인터페이스</p>
+                    </div>
+                    
+                    <div class="benefit-item">
+                        <div class="benefit-icon">🌐</div>
+                        <h4>호환성</h4>
+                        <p>국제 표준 준수로 전 세계 어디서나 사용 가능</p>
+                    </div>
+                    
+                    <div class="benefit-item">
+                        <div class="benefit-icon">💰</div>
+                        <h4>효율성</h4>
+                        <p>운영 비용 절감과 업무 프로세스 최적화</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- Contact Section -->
+    <section class="contact-section" id="contact">
+        <div class="container">
+            <h2 style="font-size: 2.5rem; margin-bottom: 1rem;">함께 만들어가는 의료 혁신</h2>
+            <p style="font-size: 1.2rem; margin-bottom: 1rem;">
+                K-Health Ticket 도입으로 귀하의 기관도 의료 서비스 혁신에 동참하세요
+            </p>
+            <p style="opacity: 0.9;">
+                맞춤형 도입 컨설팅과 기술 지원을 제공합니다
+            </p>
+            <a href="mailto:contact@k-health-ticket.com" class="contact-button">
+                📧 도입 상담 신청하기
+            </a>
+        </div>
+    </section>
+</body>
+</html>
